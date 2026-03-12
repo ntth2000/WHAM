@@ -7,7 +7,7 @@ import imageio
 import numpy as np
 from progress.bar import Bar
 
-from lib.vis.renderer import Renderer, get_global_cameras
+from lib.vis.renderer import Renderer, get_global_cameras, create_vertex_colors, _PART_MAPPING
 
 def run_vis_on_demo(cfg, video, results, output_pth, smpl, vis_global=True):
     # to torch tensor
@@ -53,6 +53,15 @@ def run_vis_on_demo(cfg, video, results, output_pth, smpl, vis_global=True):
     )
     bar = Bar('Rendering results ...', fill='#', max=length)
     
+    # Build per-vertex body-part colors ONCE — shared across all frames
+    n_verts = list(results.values())[0]['verts'].shape[-2]  # number of SMPL vertices (~6890)
+    body_part_colors = create_vertex_colors(n_verts)        # (N_verts, 3) numpy float32
+    use_part_colors = (body_part_colors is not None) and (_PART_MAPPING is not None)
+    if use_part_colors:
+        print('[Renderer] Body-part coloring enabled.')
+    else:
+        print('[Renderer] Part segmentation not available; using flat colour.')
+
     frame_i = 0
     _global_R, _global_T = None, None
     # run rendering
@@ -60,7 +69,7 @@ def run_vis_on_demo(cfg, video, results, output_pth, smpl, vis_global=True):
         flag, org_img = cap.read()
         if not flag: break
         img = org_img[..., ::-1].copy()
-        
+
         # render onto the input video
         renderer.create_camera(default_R, default_T)
         for _id, val in results.items():
@@ -68,7 +77,11 @@ def run_vis_on_demo(cfg, video, results, output_pth, smpl, vis_global=True):
             frame_i2 = np.where(val['frame_ids'] == frame_i)[0]
             if len(frame_i2) == 0: continue
             frame_i2 = frame_i2[0]
-            img = renderer.render_mesh(torch.from_numpy(val['verts'][frame_i2]).to(cfg.DEVICE), img)
+            img = renderer.render_mesh(
+                torch.from_numpy(val['verts'][frame_i2]).to(cfg.DEVICE),
+                img,
+                vertex_colors=body_part_colors if use_part_colors else None,
+            )
         
         if vis_global:
             # render the global coordinate
@@ -81,6 +94,8 @@ def run_vis_on_demo(cfg, video, results, output_pth, smpl, vis_global=True):
                 if _global_R is None:
                     _global_R = global_R[frame_i3].clone(); _global_T = global_T[frame_i3].clone()
                 cameras = renderer.create_camera(global_R[frame_i3], global_T[frame_i3])
+                # Use flat near-white for global bird's-eye view (part colors optional here)
+                colors = torch.ones((1, 4)).float().to(cfg.DEVICE); colors[..., :3] *= 0.9
                 img_glob = renderer.render_with_ground(verts, faces, colors, cameras, global_lights)
             
             try: img = np.concatenate((img, img_glob), axis=1)

@@ -1,3 +1,5 @@
+import os
+import pickle
 import cv2
 import torch
 import numpy as np
@@ -17,6 +19,56 @@ from pytorch3d.structures.meshes import join_meshes_as_scene
 from pytorch3d.renderer.cameras import look_at_rotation
 
 from .tools import get_colors, checkerboard_geometry
+
+# ---------------------------------------------------------------------------
+# Part-segmentation helpers
+# ---------------------------------------------------------------------------
+_PART_SEG_PATH = os.path.join(os.path.dirname(__file__), 'smpl_partSegmentation_mapping.pkl')
+
+# Color map: SMPL part ID → RGB (0-1 range)
+# Parts that share the same colour produce left/right symmetry highlighting.
+_PART_COLOR_MAP = {
+    1:  [1.0, 0.0, 1.0],   # L_Hip      – Magenta
+    2:  [0.0, 1.0, 1.0],   # R_Hip      – Cyan
+    4:  [1.0, 0.0, 1.0],   # L_Knee     – Magenta  (same as L_Hip)
+    5:  [0.0, 1.0, 1.0],   # R_Knee     – Cyan     (same as R_Hip)
+    16: [0.0, 1.0, 0.0],   # L_Shoulder – Lime
+    17: [1.0, 0.0, 0.0],   # R_Shoulder – Red
+    18: [0.0, 1.0, 0.0],   # L_Elbow    – Lime     (same as L_Shoulder)
+    19: [1.0, 0.0, 0.0],   # R_Elbow    – Red      (same as R_Shoulder)
+}
+_BODY_DEFAULT_COLOR = [0.8, 0.75, 0.7]  # neutral beige for the torso/head
+
+
+def _load_part_mapping(path=_PART_SEG_PATH):
+    """Load SMPL vertex→part-ID mapping from the pkl file.
+    Returns a numpy array of length N_verts, or None on failure."""
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        if 'smpl_index' in data:
+            return np.array(data['smpl_index'])
+        return None
+    except Exception as e:
+        print(f'[Renderer] Could not load part segmentation: {e}')
+        return None
+
+
+# Load once at import time so every Renderer instance can share it.
+_PART_MAPPING = _load_part_mapping()
+
+
+def create_vertex_colors(num_vertices, part_mapping=_PART_MAPPING,
+                         color_map=_PART_COLOR_MAP,
+                         default_color=_BODY_DEFAULT_COLOR):
+    """Return (num_vertices, 3) float32 array with per-body-part RGB colours."""
+    colors = np.ones((num_vertices, 3), dtype=np.float32) * np.array(default_color, dtype=np.float32)
+    if part_mapping is not None and len(part_mapping) == num_vertices:
+        for part_id, color in color_map.items():
+            indices = np.where(part_mapping == part_id)[0]
+            if len(indices) > 0:
+                colors[indices] = np.array(color, dtype=np.float32)
+    return colors
 
 
 def overlay_image_onto_background(image, mask, bbox, background):
@@ -204,24 +256,49 @@ class Renderer():
         self.cameras = self.create_camera()
         self.create_renderer()
 
-    def render_mesh(self, vertices, background, colors=[0.8, 0.8, 0.8]):
+    def render_mesh(self, vertices, background, colors=[0.8, 0.8, 0.8],
+                    vertex_colors=None):
+        """Render a single mesh onto *background*.
+
+        Args:
+            vertices:      (N_verts, 3) torch tensor in camera space.
+            background:    HxWx3 numpy image.
+            colors:        Flat RGB list [r, g, b] used when *vertex_colors* is None.
+            vertex_colors: Optional (N_verts, 3) numpy array with per-vertex RGB
+                           values in [0, 1].  When provided, each vertex gets its
+                           own colour (enabling body-part colouring).
+        """
         self.update_bbox(vertices[::50], scale=1.2)
-        vertices = vertices.unsqueeze(0)
-        
-        if colors[0] > 1: colors = [c / 255. for c in colors]
-        verts_features = torch.tensor(colors).reshape(1, 1, 3).to(device=vertices.device, dtype=vertices.dtype)
-        verts_features = verts_features.repeat(1, vertices.shape[1], 1)
+        vertices = vertices.unsqueeze(0)          # (1, N_verts, 3)
+
+        if vertex_colors is not None:
+            # Per-vertex colouring path
+            verts_features = torch.tensor(
+                vertex_colors, dtype=vertices.dtype, device=vertices.device
+            ).unsqueeze(0)                        # (1, N_verts, 3)
+            flat_color = _BODY_DEFAULT_COLOR      # used only for Materials
+        else:
+            # Flat single-colour path (original behaviour)
+            if colors[0] > 1:
+                colors = [c / 255. for c in colors]
+            verts_features = torch.tensor(colors).reshape(1, 1, 3).to(
+                device=vertices.device, dtype=vertices.dtype
+            ).repeat(1, vertices.shape[1], 1)    # (1, N_verts, 3)
+            flat_color = colors
+
         textures = TexturesVertex(verts_features=verts_features)
-        
-        mesh = Meshes(verts=vertices,
-                      faces=self.faces,
-                      textures=textures,)
-        
+
+        mesh = Meshes(
+            verts=vertices,
+            faces=self.faces,
+            textures=textures,
+        )
+
         materials = Materials(
             device=self.device,
-            specular_color=(colors, ),
-            shininess=0
-            )
+            specular_color=(flat_color,),
+            shininess=0,
+        )
 
         results = torch.flip(
             self.renderer(mesh, materials=materials, cameras=self.cameras, lights=self.lights),
