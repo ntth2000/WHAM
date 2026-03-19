@@ -13,7 +13,7 @@ from progress.bar import Bar
 
 from configs.config import get_cfg_defaults
 from lib.data.datasets import CustomDataset
-from lib.utils.imutils import avg_preds
+from lib.utils.imutils import avg_preds, get_video_rotation, rotate_frame
 from lib.utils.transforms import matrix_to_axis_angle
 from lib.models import build_network, build_body_model
 from lib.models.preproc.detector import DetectionModel
@@ -41,6 +41,10 @@ def run(cfg,
     fps = cap.get(cv2.CAP_PROP_FPS)
     length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width, height = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    rotation = get_video_rotation(video)
+    if rotation in (90, 270):
+        width, height = height, width
     
     # Whether or not estimating motion in global coordinates
     run_global = run_global and _run_global
@@ -60,7 +64,8 @@ def run(cfg,
             while (cap.isOpened()):
                 flag, img = cap.read()
                 if not flag: break
-                
+                img = rotate_frame(img, rotation)
+
                 # 2D detection and tracking
                 detector.track(img, fps, length)
                 

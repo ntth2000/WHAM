@@ -1,5 +1,7 @@
 import os
 import cv2
+import json
+import subprocess
 import torch
 import random
 import numpy as np
@@ -279,6 +281,34 @@ def compute_cam_intrinsics(res, calib=None):
     cam_intrinsics[:, 0, 2] = cx
     cam_intrinsics[:, 1, 2] = cy
     return cam_intrinsics
+
+
+def get_video_rotation(video_path):
+    """Return rotation angle (0, 90, 180, 270) from video metadata via ffprobe."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', video_path],
+            capture_output=True, text=True, check=True
+        )
+        for stream in json.loads(result.stdout).get('streams', []):
+            if stream.get('codec_type') == 'video':
+                rotate = stream.get('tags', {}).get('rotate')
+                if rotate is not None:
+                    return int(rotate)
+    except Exception:
+        pass
+    return 0
+
+
+def rotate_frame(img, rotation):
+    """Rotate a cv2 image by the given angle (0, 90, 180, 270)."""
+    if rotation == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    elif rotation == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img
 
 
 def flip_kp(kp, img_w=None):

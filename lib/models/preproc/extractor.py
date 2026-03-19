@@ -14,7 +14,7 @@ from scipy.ndimage.filters import gaussian_filter1d
 from configs import constants as _C
 from .backbone.hmr2 import hmr2
 from .backbone.utils import process_image
-from ...utils.imutils import flip_kp, flip_bbox
+from ...utils.imutils import flip_kp, flip_bbox, get_video_rotation, rotate_frame
 
 ROOT_DIR = osp.abspath(f"{__file__}/../../../../")
 
@@ -35,11 +35,15 @@ class FeatureExtractor(object):
             is_video = True
             length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width, height = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            rotation = get_video_rotation(video)
+            if rotation in (90, 270):
+                width, height = height, width
         else:   # Image list
             cap = video
             is_video = False
             length = len(video)
             height, width = cv2.imread(video[0]).shape[:2]
+            rotation = 0
         
         frame_id = 0
         bar = Bar('Feature extraction ...', fill='#', max=length)
@@ -48,6 +52,7 @@ class FeatureExtractor(object):
                 flag, img = cap.read()
                 if not flag:
                     break
+                img = rotate_frame(img, rotation)
             else:
                 if frame_id >= len(cap):
                     break
