@@ -1,15 +1,23 @@
 """
-Extract camera intrinsics from video metadata (ffprobe) and save as calib.txt.
+Extract camera intrinsics from video metadata and save as calib.txt.
+
+Strategy:
+  1. ffprobe  — reads standard QuickTime/MP4 tags
+  2. exiftool — fallback for Apple-specific tags (iPhone focal length, etc.)
+  3. Heuristic sqrt(w^2+h^2) if nothing found
 
 Usage:
-    python lib/utils/extract_calib.py --video path/to/video.mp4 --output calib.txt
-    python lib/utils/extract_calib.py --video path/to/video.mp4 --verbose
+    python lib/utils/extract_calib.py --video path/to/video.mov --output calib.txt
+    python lib/utils/extract_calib.py --video path/to/video.mov --verbose
 
 Output format (same as SLAM calib.txt):
     fx fy cx cy
 
 Requirements:
-    ffmpeg/ffprobe installed (https://ffmpeg.org/download.html)
+    ffmpeg/ffprobe  (https://ffmpeg.org/download.html)
+    exiftool        optional but recommended for iPhone videos
+                    macOS: brew install exiftool
+                    Ubuntu: sudo apt install libimage-exiftool-perl
 """
 
 import os
@@ -42,6 +50,47 @@ def get_video_resolution(meta):
             if w and h:
                 return int(w), int(h)
     raise RuntimeError("No video stream found.")
+
+
+def parse_focal_lengths_exiftool(video_path):
+    """
+    Use exiftool to extract focal length tags — handles Apple QuickTime atoms
+    that ffprobe misses (e.g. 'Camera Focal Length 35mm Equivalent').
+    Returns (fl_mm, fl_35mm), either can be None.
+    """
+    try:
+        result = subprocess.run(
+            ['exiftool', '-FocalLength', '-FocalLengthIn35mmFormat',
+             '-CameraFocalLength', '-s3', video_path],
+            capture_output=True, text=True, check=True
+        )
+    except FileNotFoundError:
+        return None, None  # exiftool not installed, skip silently
+    except subprocess.CalledProcessError:
+        return None, None
+
+    fl_mm, fl_35mm = None, None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # exiftool -s3 outputs bare values, one per -tag flag, in order
+        # but values may look like "4.2 mm" or "27"
+        try:
+            val = float(line.split()[0])
+        except (ValueError, IndexError):
+            continue
+        if fl_mm is None:
+            fl_mm = val
+        elif fl_35mm is None:
+            fl_35mm = val
+
+    # If only one value came back and it looks like a 35mm equiv (>= 20mm typical)
+    # treat it as fl_35mm, not fl_mm
+    if fl_mm is not None and fl_35mm is None and fl_mm >= 10:
+        fl_35mm, fl_mm = fl_mm, None
+
+    return fl_mm, fl_35mm
 
 
 def parse_focal_lengths(meta):
@@ -148,7 +197,12 @@ if __name__ == '__main__':
         print_all_tags(meta)
 
     img_w, img_h = get_video_resolution(meta)
+
+    # Try ffprobe tags first, then exiftool as fallback
     fl_mm, fl_35mm = parse_focal_lengths(meta)
+    if fl_mm is None and fl_35mm is None:
+        fl_mm, fl_35mm = parse_focal_lengths_exiftool(args.video)
+
     fx, fy, cx, cy, method = compute_intrinsics(img_w, img_h, fl_mm, fl_35mm)
 
     print(f"Source     : {args.video}")
