@@ -1,23 +1,24 @@
 """
-Extract camera intrinsics from video metadata and save as calib.txt.
+Extract camera intrinsics from image EXIF or video metadata, save as calib.txt.
 
 Strategy:
-  1. ffprobe  — reads standard QuickTime/MP4 tags
-  2. exiftool — fallback for Apple-specific tags (iPhone focal length, etc.)
-  3. Heuristic sqrt(w^2+h^2) if nothing found
+  --image: PIL EXIF → exiftool fallback → heuristic
+  --video: ffprobe  → exiftool fallback → heuristic
 
 Usage:
-    python lib/utils/extract_calib.py --video path/to/video.mov --output calib.txt
-    python lib/utils/extract_calib.py --video path/to/video.mov --verbose
+    python lib/utils/extract_calib.py --image photo.jpg  --output calib.txt
+    python lib/utils/extract_calib.py --video video.mov  --output calib.txt
+    python lib/utils/extract_calib.py --video video.mov  --verbose
 
 Output format (same as SLAM calib.txt):
     fx fy cx cy
 
 Requirements:
-    ffmpeg/ffprobe  (https://ffmpeg.org/download.html)
-    exiftool        optional but recommended for iPhone videos
-                    macOS: brew install exiftool
-                    Ubuntu: sudo apt install libimage-exiftool-perl
+    Pillow    (pip install Pillow)               — for --image
+    ffprobe   (https://ffmpeg.org/download.html) — for --video
+    exiftool  optional, improves iPhone/Samsung support
+              macOS: brew install exiftool
+              Ubuntu: sudo apt install libimage-exiftool-perl
 """
 
 import os
@@ -25,13 +26,113 @@ import json
 import argparse
 import subprocess
 
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+
+# ---------------------------------------------------------------------------
+# Shared: exiftool fallback (works on both images and videos)
+# ---------------------------------------------------------------------------
+
+def parse_focal_lengths_exiftool(file_path):
+    """
+    Use exiftool to read focal length tags.
+    Returns (fl_mm, fl_35mm), either can be None.
+    """
+    try:
+        result = subprocess.run(
+            ['exiftool', '-FocalLength', '-FocalLengthIn35mmFormat',
+             '-CameraFocalLength', '-s3', file_path],
+            capture_output=True, text=True, check=True
+        )
+    except FileNotFoundError:
+        return None, None  # exiftool not installed
+    except subprocess.CalledProcessError:
+        return None, None
+
+    fl_mm, fl_35mm = None, None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            val = float(line.split()[0])
+        except (ValueError, IndexError):
+            continue
+        if fl_mm is None:
+            fl_mm = val
+        elif fl_35mm is None:
+            fl_35mm = val
+
+    # Single value >= 10mm is likely a 35mm equivalent, not actual focal length
+    if fl_mm is not None and fl_35mm is None and fl_mm >= 10:
+        fl_35mm, fl_mm = fl_mm, None
+
+    return fl_mm, fl_35mm
+
+
+# ---------------------------------------------------------------------------
+# Image (PIL EXIF)
+# ---------------------------------------------------------------------------
+
+def get_exif(image_path):
+    img = Image.open(image_path)
+    exif_data = img._getexif()
+    if exif_data is None:
+        return {}, img.size
+    exif = {TAGS.get(tag_id, tag_id): val for tag_id, val in exif_data.items()}
+    return exif, img.size
+
+
+def parse_exif_focal_lengths(exif):
+    def to_float(v):
+        if v is None:
+            return None
+        if hasattr(v, 'numerator'):
+            return float(v.numerator) / float(v.denominator)
+        if isinstance(v, tuple):
+            return v[0] / v[1]
+        return float(v)
+
+    return to_float(exif.get('FocalLength')), to_float(exif.get('FocalLengthIn35mmFilm'))
+
+
+def extract_from_image(image_path):
+    if not HAS_PIL:
+        raise RuntimeError("Pillow is required: pip install Pillow")
+
+    exif, (img_w, img_h) = get_exif(image_path)
+    fl_mm, fl_35mm = parse_exif_focal_lengths(exif)
+
+    if fl_mm is None and fl_35mm is None:
+        fl_mm, fl_35mm = parse_focal_lengths_exiftool(image_path)
+
+    return img_w, img_h, fl_mm, fl_35mm
+
+
+def print_image_tags(exif):
+    print("\n--- Image EXIF Tags ---")
+    keys = ['Make', 'Model', 'FocalLength', 'FocalLengthIn35mmFilm',
+            'ExifImageWidth', 'ExifImageHeight', 'DateTime']
+    for k in keys:
+        if k in exif:
+            print(f"  {k}: {exif[k]}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Video (ffprobe + exiftool fallback)
+# ---------------------------------------------------------------------------
 
 def get_video_metadata(video_path):
     cmd = [
         'ffprobe', '-v', 'quiet',
         '-print_format', 'json',
-        '-show_streams',
-        '-show_format',
+        '-show_streams', '-show_format',
         video_path
     ]
     try:
@@ -52,76 +153,21 @@ def get_video_resolution(meta):
     raise RuntimeError("No video stream found.")
 
 
-def parse_focal_lengths_exiftool(video_path):
-    """
-    Use exiftool to extract focal length tags — handles Apple QuickTime atoms
-    that ffprobe misses (e.g. 'Camera Focal Length 35mm Equivalent').
-    Returns (fl_mm, fl_35mm), either can be None.
-    """
-    try:
-        result = subprocess.run(
-            ['exiftool', '-FocalLength', '-FocalLengthIn35mmFormat',
-             '-CameraFocalLength', '-s3', video_path],
-            capture_output=True, text=True, check=True
-        )
-    except FileNotFoundError:
-        return None, None  # exiftool not installed, skip silently
-    except subprocess.CalledProcessError:
-        return None, None
-
-    fl_mm, fl_35mm = None, None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # exiftool -s3 outputs bare values, one per -tag flag, in order
-        # but values may look like "4.2 mm" or "27"
-        try:
-            val = float(line.split()[0])
-        except (ValueError, IndexError):
-            continue
-        if fl_mm is None:
-            fl_mm = val
-        elif fl_35mm is None:
-            fl_35mm = val
-
-    # If only one value came back and it looks like a 35mm equiv (>= 20mm typical)
-    # treat it as fl_35mm, not fl_mm
-    if fl_mm is not None and fl_35mm is None and fl_mm >= 10:
-        fl_35mm, fl_mm = fl_mm, None
-
-    return fl_mm, fl_35mm
-
-
-def parse_focal_lengths(meta):
-    """
-    Try to extract focal length from video metadata tags.
-    Returns (fl_mm, fl_35mm), either can be None.
-
-    Common sources:
-      - iPhone/iPad: com.apple.quicktime.camera.focal_length(.35mm_equivalent)
-      - Some Android/GoPro: generic 'focal_length' tags in format or stream tags
-    """
-    fl_mm, fl_35mm = None, None
-
+def parse_ffprobe_focal_lengths(meta):
     all_tags = {}
     all_tags.update(meta.get('format', {}).get('tags', {}))
     for stream in meta.get('streams', []):
         all_tags.update(stream.get('tags', {}))
 
-    # Normalize keys to lowercase for matching
-    tags_lower = {k.lower(): v for k, v in all_tags.items()}
-
-    for key, val in tags_lower.items():
+    fl_mm, fl_35mm = None, None
+    for key, val in {k.lower(): v for k, v in all_tags.items()}.items():
         if 'focal_length' not in key:
             continue
         try:
-            # Rational string "num/den" or plain float
             num = float(str(val).split('/')[0]) / float(str(val).split('/')[1]) \
                 if '/' in str(val) else float(val)
         except (ValueError, TypeError, IndexError):
             continue
-
         if '35mm' in key:
             fl_35mm = num
         else:
@@ -130,35 +176,18 @@ def parse_focal_lengths(meta):
     return fl_mm, fl_35mm
 
 
-def compute_intrinsics(img_w, img_h, fl_mm, fl_35mm):
-    cx = img_w / 2.0
-    cy = img_h / 2.0
+def extract_from_video(video_path):
+    meta = get_video_metadata(video_path)
+    img_w, img_h = get_video_resolution(meta)
+    fl_mm, fl_35mm = parse_ffprobe_focal_lengths(meta)
 
-    if fl_mm and fl_35mm:
-        crop_factor = fl_35mm / fl_mm
-        sensor_w = 36.0 / crop_factor
-        sensor_h = 24.0 / crop_factor
-        fx = fl_mm / sensor_w * img_w
-        fy = fl_mm / sensor_h * img_h
-        method = (f"focal_mm={fl_mm:.2f}mm + 35mm_equiv={fl_35mm}mm "
-                  f"→ sensor={sensor_w:.2f}x{sensor_h:.2f}mm")
+    if fl_mm is None and fl_35mm is None:
+        fl_mm, fl_35mm = parse_focal_lengths_exiftool(video_path)
 
-    elif fl_35mm:
-        fx = fy = (fl_35mm / 36.0) * img_w
-        method = f"35mm_equiv={fl_35mm}mm only (fx=fy assumed)"
-
-    elif fl_mm:
-        fx = fy = (fl_mm / 36.0) * img_w
-        method = f"focal_mm={fl_mm:.2f}mm only, assumed full-frame sensor"
-
-    else:
-        fx = fy = (img_w ** 2 + img_h ** 2) ** 0.5
-        method = "heuristic sqrt(w^2+h^2) — no focal length in metadata"
-
-    return fx, fy, cx, cy, method
+    return img_w, img_h, fl_mm, fl_35mm, meta
 
 
-def print_all_tags(meta):
+def print_video_tags(meta):
     print("\n--- Video Metadata Tags ---")
     fmt_tags = meta.get('format', {}).get('tags', {})
     if fmt_tags:
@@ -174,38 +203,75 @@ def print_all_tags(meta):
     print()
 
 
+# ---------------------------------------------------------------------------
+# Shared: compute intrinsics
+# ---------------------------------------------------------------------------
+
+def compute_intrinsics(img_w, img_h, fl_mm, fl_35mm):
+    cx, cy = img_w / 2.0, img_h / 2.0
+
+    if fl_mm and fl_35mm:
+        crop_factor = fl_35mm / fl_mm
+        sensor_w = 36.0 / crop_factor
+        sensor_h = 24.0 / crop_factor
+        fx = fl_mm / sensor_w * img_w
+        fy = fl_mm / sensor_h * img_h
+        method = (f"focal_mm={fl_mm:.2f}mm + 35mm_equiv={fl_35mm}mm "
+                  f"→ sensor={sensor_w:.2f}x{sensor_h:.2f}mm")
+    elif fl_35mm:
+        fx = fy = (fl_35mm / 36.0) * img_w
+        method = f"35mm_equiv={fl_35mm}mm only (fx=fy assumed)"
+    elif fl_mm:
+        fx = fy = (fl_mm / 36.0) * img_w
+        method = f"focal_mm={fl_mm:.2f}mm only, assumed full-frame sensor"
+    else:
+        fx = fy = (img_w ** 2 + img_h ** 2) ** 0.5
+        method = "heuristic sqrt(w^2+h^2) — no focal length in metadata"
+
+    return fx, fy, cx, cy, method
+
+
 def save_calib(fx, fy, cx, cy, output_path):
     with open(output_path, 'w') as f:
         f.write(f"{fx:.4f} {fy:.4f} {cx:.4f} {cy:.4f}\n")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Extract camera intrinsics from video metadata')
-    parser.add_argument('--video',   type=str, required=True, help='Path to video file (MP4/MOV/...)')
+        description='Extract camera intrinsics from image EXIF or video metadata')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--image', type=str, help='Path to image file (JPEG)')
+    group.add_argument('--video', type=str, help='Path to video file (MP4/MOV/...)')
     parser.add_argument('--output',  type=str, default='calib.txt', help='Output calib.txt path')
     parser.add_argument('--verbose', action='store_true', help='Print all metadata tags')
     args = parser.parse_args()
 
-    if not os.path.exists(args.video):
-        print(f"ERROR: Video not found: {args.video}")
+    source = args.image or args.video
+    if not os.path.exists(source):
+        print(f"ERROR: File not found: {source}")
         exit(1)
 
-    meta = get_video_metadata(args.video)
+    if args.image:
+        if not HAS_PIL:
+            print("ERROR: Pillow not installed. Run: pip install Pillow")
+            exit(1)
+        if args.verbose:
+            exif, _ = get_exif(args.image)
+            print_image_tags(exif)
+        img_w, img_h, fl_mm, fl_35mm = extract_from_image(args.image)
 
-    if args.verbose:
-        print_all_tags(meta)
-
-    img_w, img_h = get_video_resolution(meta)
-
-    # Try ffprobe tags first, then exiftool as fallback
-    fl_mm, fl_35mm = parse_focal_lengths(meta)
-    if fl_mm is None and fl_35mm is None:
-        fl_mm, fl_35mm = parse_focal_lengths_exiftool(args.video)
+    else:  # --video
+        img_w, img_h, fl_mm, fl_35mm, meta = extract_from_video(args.video)
+        if args.verbose:
+            print_video_tags(meta)
 
     fx, fy, cx, cy, method = compute_intrinsics(img_w, img_h, fl_mm, fl_35mm)
 
-    print(f"Source     : {args.video}")
+    print(f"Source     : {source}")
     print(f"Resolution : {img_w} x {img_h} px")
     print(f"Method     : {method}")
     print(f"Intrinsics : fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
