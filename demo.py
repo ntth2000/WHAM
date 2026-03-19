@@ -95,7 +95,7 @@ def run(cfg,
             logger.info(f'Already processed data exists at {output_pth} ! Load the data .')
     
     # Build dataset
-    dataset = CustomDataset(cfg, tracking_results, slam_results, width, height, fps)
+    dataset = CustomDataset(cfg, tracking_results, slam_results, width, height, fps, calib)
     
     # run WHAM
     results = defaultdict(dict)

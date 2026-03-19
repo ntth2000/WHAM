@@ -1,3 +1,4 @@
+import os
 import cv2
 import torch
 import random
@@ -263,14 +264,20 @@ def transform(pt, center, scale, res, invert=0, rot=0):
     return new_pt[:2].astype(int) + 1
 
 
-def compute_cam_intrinsics(res):
+def compute_cam_intrinsics(res, calib=None):
     img_w, img_h = res
-    focal_length = (img_w * img_w + img_h * img_h) ** 0.5
+    if calib is not None and os.path.exists(calib):
+        with open(calib, 'r') as f:
+            fx, fy, cx, cy = map(float, f.read().split())
+    else:
+        focal_length = (img_w * img_w + img_h * img_h) ** 0.5
+        fx = fy = focal_length
+        cx, cy = img_w / 2., img_h / 2.
     cam_intrinsics = torch.eye(3).repeat(1, 1, 1).float()
-    cam_intrinsics[:, 0, 0] = focal_length
-    cam_intrinsics[:, 1, 1] = focal_length
-    cam_intrinsics[:, 0, 2] = img_w/2.
-    cam_intrinsics[:, 1, 2] = img_h/2.
+    cam_intrinsics[:, 0, 0] = fx
+    cam_intrinsics[:, 1, 1] = fy
+    cam_intrinsics[:, 0, 2] = cx
+    cam_intrinsics[:, 1, 2] = cy
     return cam_intrinsics
 
 

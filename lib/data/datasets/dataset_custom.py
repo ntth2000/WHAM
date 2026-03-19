@@ -39,15 +39,14 @@ def convert_dpvo_to_cam_angvel(traj, fps):
 
 
 class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, cfg, tracking_results, slam_results, width, height, fps):
-        
+    def __init__(self, cfg, tracking_results, slam_results, width, height, fps, calib=None):
         self.tracking_results = tracking_results
         self.slam_results = slam_results
         self.width = width
         self.height = height
         self.fps = fps
         self.res = torch.tensor([width, height]).float()
-        self.intrinsics = compute_cam_intrinsics(self.res)
+        self.intrinsics = compute_cam_intrinsics(self.res, calib)
         
         self.device = cfg.DEVICE.lower()
         
